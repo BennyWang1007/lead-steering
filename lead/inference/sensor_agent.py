@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import os
@@ -38,6 +39,18 @@ from lead.inference.video_recorder import VideoRecorder
 from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import Visualizer
 
+from activation_steering.feature_collectors.tfv6 import TFv6FeatureCollector
+from depth_ttc_gate import DepthTTCClient
+from vlm_gate import AsyncVLMGate
+from activation_steering.policy import (
+    depth_ttc_enabled_from_env,
+    policy_from_env,
+    DepthTTCPolicy,
+    steering_override_enabled_from_env,
+    classify_override_alpha,
+    OverrideTrajectory,
+)
+
 matplotlib.use("Agg")  # non-GUI backend for headless servers
 
 setup_logging()
@@ -56,7 +69,7 @@ def get_entry_point():  # dead: disable
 
 class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
     @beartype
-    def setup(self, path_to_conf_file: str, route_index=None, __=None):
+    def setup(self, path_to_conf_file: str, route_index=None, __=None):  # pyright: ignore[reportIncompatibleMethodOverride]
         # Set up test time training default parameters
         self.config_closed_loop = ClosedLoopConfig()
         super().setup(sensor_agent=True)
@@ -95,19 +108,107 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             device=self.device,
             prefix="model",
         )
-        self.planning_queries_save_path = self._planning_queries_save_path()
-        if self.planning_queries_save_path is not None:
-            self.planning_queries_save_path.mkdir(parents=True, exist_ok=True)
-            LOG.info(
-                "Saving planner queries to %s (shape: [1, num_queries, token_dim])",
-                self.planning_queries_save_path,
-            )
+
+        # Cast all ensemble sub-networks to match the training float type (e.g., bfloat16/float32)
+        target_dtype = self.training_config.torch_float_type
+        for net in self.closed_loop_inference.nets:
+            net.to(dtype=target_dtype)
+
+        # Feature Collector Setup
+        self.save_features = self._env_flag("SAVE_FEATURES") or self._env_flag("SAVE_FUSED_FEATURES")
+        features_root = os.environ.get("FEATURES_ROOT") or os.environ.get("FUSED_FEATURES_PATH")
+        self.feature_collectors: list[TFv6FeatureCollector] = []
+
+        print("[SensorAgent.setup] SAVE_FEATURES:", self.save_features)
+        print("[SensorAgent.setup] FEATURES_ROOT:", features_root)
+
+        if self.save_features:
+            if features_root is not None:
+                self.features_root = Path(features_root)
+            elif self.config_closed_loop.save_path is not None:
+                self.features_root = self.config_closed_loop.save_path / "fused_features"
+            else:
+                self.features_root = Path("fused_features")
+
+            if self.route_run_id:
+                self.features_root /= self.route_run_id
+
+            for model_idx, net in enumerate(self.closed_loop_inference.nets):
+                feature_collector = TFv6FeatureCollector(
+                    output_root=self.features_root,
+                    model_idx=model_idx,
+                    save_fused=True,
+                    decoder_layers=(4, 5, 6),
+                )
+                feature_collector.attach(net)
+                self.feature_collectors.append(feature_collector)
+
+                LOG.info("Saving features using %s to %s", self.feature_collectors[model_idx].__class__.__name__, self.features_root)
+
         self.activation_action_log = self._activation_action_log_path()
+        print("[SensorAgent.setup] ACTIVATION_ACTION_LOG:", self.activation_action_log)
         if self.activation_action_log is not None:
             LOG.info("Saving activation actions to %s", self.activation_action_log)
 
+        # Steering override initialization
+        self.steering_override = steering_override_enabled_from_env()
+        self.override_traj = OverrideTrajectory.from_env() if self.steering_override else None
+        # if self.steering_override and self.depth_ttc_steering:
+        #     raise ValueError(
+        #         "STEERING_OVERRIDE is not compatible with Depth-TTC: candidate forwards would all be "
+        #         "identical (no steering applied), so the candidate scoring is meaningless."
+        #     )
+        print("[SensorAgent.setup] STEERING_OVERRIDE:", self.steering_override)
+
+        # Activation steering & Depth-TTC initialization
+        self.depth_ttc_steering = depth_ttc_enabled_from_env()
+        self.depth_ttc_client = None
+
+        print("[SensorAgent.setup] DEPTH_TTC_STEERING:", self.depth_ttc_steering)
+        if self.depth_ttc_steering:
+            self.depth_ttc_client = DepthTTCClient.from_env()
+            LOG.info("Depth TTC steering enabled: %s", self.depth_ttc_client.server_url)
+            print(
+                "[DepthTTC] inference interception enabled: "
+                "run_step replaces the normal single forward pass with candidate "
+                "forward passes, then uses the selected candidate for control",
+                flush=True,
+            )
+
+        vlm_enabled = self._env_flag("VLM_STEERING") and not self.depth_ttc_steering
+        self.activation_policy = policy_from_env(
+            vlm_enabled=vlm_enabled,
+            depth_ttc_client=self.depth_ttc_client,
+            training_config=self.training_config,
+        )
+        LOG.info("Loaded Activation Policy: %s", self.activation_policy.__class__.__name__)
+
+        # VLM gate: background thread that uploads front-camera frames (+ speed / command /
+        # target point / ego history) to the Alpamayo server and exposes the latest decision.
+        self.vlm_gate: AsyncVLMGate | None = None
+        self.vlm_last_decision = None
+        self.vlm_last_decision_key = None
+        self.vlm_decision_start_frame = None
+        self.vlm_decision_age_frames = None
+        self.vlm_history_steps = int(os.environ.get("VLM_ALPAMAYO_HISTORY_STEPS", 16))
+        self.vlm_history_stride = int(os.environ.get("VLM_ALPAMAYO_HISTORY_STRIDE_FRAMES", 2))
+        # Only send requests to the VLM while ego speed (m/s) is above this value.
+        # HOW TO DISABLE: set env VLM_MIN_SPEED_MPS=0 (or any value <= 0) -> request at every VLM_EVERY_N frames.
+        # Side effect of the default (3.5): once the car is slower than 3.5 m/s (e.g. braked by the VLM itself)
+        # no new decision is requested, and the last one expires after VLM_DECISION_TTL_FRAMES.
+        self.vlm_min_speed = float(os.environ.get("VLM_MIN_SPEED_MPS", 3.5))
+        # rgb_2 / original_rgb come straight from CARLA/cv2 in BGR order; AsyncVLMGate expects RGB.
+        # Set VLM_INPUT_IS_BGR=0 if the front image is already RGB.
+        self.vlm_input_is_bgr = os.environ.get("VLM_INPUT_IS_BGR", "1").lower() in {"1", "true", "t", "yes", "y"}
+        self._vlm_history_warned = False
+        print("[SensorAgent.setup] VLM_STEERING enabled:", vlm_enabled)
+        print("[SensorAgent.setup] VLM_MIN_SPEED_MPS:", self.vlm_min_speed)
+        if vlm_enabled:
+            self.vlm_gate = AsyncVLMGate.from_env()
+            self.vlm_gate.start()
+
         # Post-processing heuristics
-        self.bb_buffer = deque(maxlen=1)
+        self.bb_buffer: deque = deque(maxlen=1)
         self.stop_sign_post_processor = StopSignPostProcessor(
             config=self.training_config,
             config_test_time=self.config_closed_loop,
@@ -118,7 +219,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             config_test_time=self.config_closed_loop,
             lidar_queue=self.lidar_pc_queue,
         )
-        self.metric_info = {}
+        self.metric_info: dict = {}
         self.meters_travelled = 0.0
 
         # Infraction tracking
@@ -136,26 +237,210 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 "ffmpeg is not installed or not found in PATH. Please install ffmpeg to use video compression.",
             )
 
+        self.debug_image_saved_once = False
+
     @staticmethod
     def _env_flag(name: str) -> bool:
         return os.environ.get(name, "").lower() in {"1", "true", "t", "yes", "y"}
 
-    def _planning_queries_save_path(self) -> Path | None:
-        """Resolve the feature directory using the TransFuser collector contract."""
-        if not self._env_flag("SAVE_FUSED_FEATURES"):
-            return None
+    @staticmethod
+    def _depth_ttc_enabled_from_env() -> bool:
+        policy_name = os.environ.get("ACTIVATION_POLICY", os.environ.get("STEERING_POLICY", "")).lower()
+        return (
+            os.environ.get("DEPTH_TTC_STEERING", "").lower() in {"1", "true", "t", "yes", "y"}
+            or policy_name in ("depth_ttc", "depth-ttc", "depthttc")
+        )
 
-        root = os.environ.get("FUSED_FEATURES_PATH")
-        if root is not None:
-            save_path = Path(root)
-        elif self.config_closed_loop.save_path is not None:
-            save_path = self.config_closed_loop.save_path / "fused_features"
+    def _depth_ttc_camera_image(self, input_data: dict) -> np.ndarray:
+        """Return the front-camera image expected by the Depth-TTC policy."""
+        # os.makedirs("debug_data", exist_ok=True)
+
+        if not self.debug_image_saved_once and self.step > 20:
+            self.debug_image_saved_once = True
+
+            for i in range(1, 7):
+                key = f"rgb_{i}"
+                if key not in input_data:
+                    continue
+                image = input_data[key]
+
+                # Adjust this depending on your actual sensor format.
+                image = np.asarray(image)
+
+                print(key, image.shape, image.dtype)
+                np.save(f"debug_data/{key}.npy", image)
+
+            for name in ["original_rgb", "rgb"]:
+                if name in input_data:
+                    image = np.asarray(input_data[name])
+                    print(name, image.shape, image.dtype)
+                    np.save(f"debug_data/{name}.npy", image)
+
+            image = np.asarray(input_data["original_rgb"])
+            front_width = self.training_config.camera_calibration[1]["width"]
+
+            front_image = image[:, :front_width]
+            print("front_image", front_image.shape, front_image.dtype)
+            np.save("debug_data/front_image.npy", front_image)
+
+        front_image = input_data.get("rgb_2")
+        if front_image is not None:
+            return np.asarray(front_image)
+
+        image = np.asarray(input_data["original_rgb"])
+        front_width = self.training_config.camera_calibration[1]["width"]
+        # return image[:, :front_width]  # This is the left camera
+        return image[:, front_width : 2 * front_width]  # This is the front camera
+
+    def _vlm_front_image(self, input_data: dict) -> np.ndarray:
+        """Front camera image for the VLM as an RGB uint8 HxWx3 array (no debug side effects)."""
+        front_image = input_data.get("rgb_2")
+        if front_image is None:
+            image = np.asarray(input_data["original_rgb"])
+            front_width = self.training_config.camera_calibration[1]["width"]
+            front_image = image[:, front_width : 2 * front_width]
+        front_image = np.asarray(front_image)
+        if self.vlm_input_is_bgr:
+            front_image = front_image[..., ::-1]
+        return np.ascontiguousarray(front_image)
+
+    @staticmethod
+    def _vlm_command_id(input_data: dict) -> int:
+        """RoadOption id (1..6) recovered from the one-hot command the model sees."""
+        return int(np.argmax(np.asarray(input_data["command"]).reshape(-1))) + 1
+
+    @staticmethod
+    def _yaw_rotation_matrix(yaw: float) -> np.ndarray:
+        c = float(np.cos(yaw))
+        s = float(np.sin(yaw))
+        return np.asarray(
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+    def _vlm_ego_history(self):
+        """Ego history in the current ego frame for Alpamayo (native_traj / native_cot modes).
+
+        Uses BaseAgent.ego_past_positions / ego_past_yaws (oldest -> current, already expressed in the
+        current ego frame). Returns (xyz [1,1,T,3], rot [1,1,T,3,3]) as nested lists, or (None, None).
+        Indexing matches the reference agent: T=vlm_history_steps samples, spaced vlm_history_stride frames
+        apart, ending at the current frame; missing history is padded with the oldest available sample.
+        """
+        try:
+            positions = self.ego_past_positions
+            yaws = self.ego_past_yaws
+        except Exception as exc:  # noqa: BLE001 - never let VLM history break driving
+            if not self._vlm_history_warned:
+                self._vlm_history_warned = True
+                LOG.warning("VLM ego history unavailable (%s); sending None", exc)
+            return None, None
+        if len(positions) == 0 or len(yaws) == 0:
+            return None, None
+
+        steps, stride = self.vlm_history_steps, self.vlm_history_stride
+        xyz = np.zeros((steps, 3), dtype=np.float32)
+        rot = np.zeros((steps, 3, 3), dtype=np.float32)
+        for k in range(steps):
+            back = stride * (steps - 1 - k)
+            pos_idx = max(0, len(positions) - 1 - back)
+            yaw_idx = max(0, len(yaws) - 1 - back)
+            xyz[k, :2] = positions[pos_idx]
+            rot[k] = self._yaw_rotation_matrix(yaws[yaw_idx])
+        return xyz.reshape(1, 1, steps, 3).tolist(), rot.reshape(1, 1, steps, 3, 3).tolist()
+
+    @staticmethod
+    def _alpha_active(activation_alpha) -> bool:
+        values = SensorAgent._serialize_alpha(activation_alpha)
+        if values is None:
+            return False
+        if isinstance(values, list):
+            return any(abs(v) > 1e-6 for v in values)
+        return abs(values) > 1e-6
+
+    def _vlm_policy_alpha(self):
+        """Fetch the newest VLM decision, compute its age in frames and map it to an alpha vector."""
+        decision = self.vlm_gate.latest()
+        age = None
+        if decision is not None:
+            decision_key = (decision.frame_id, decision.timestamp)
+            if decision_key != self.vlm_last_decision_key:
+                self.vlm_last_decision_key = decision_key
+                self.vlm_decision_start_frame = self.step
+            age = self.step - self.vlm_decision_start_frame
+        self.vlm_last_decision = decision
+        self.vlm_decision_age_frames = age
+
+        alpha = self.activation_policy.alpha(self.step, decision, decision_age_frames=age)
+        if self.vlm_gate.verbose:
+            if decision is None:
+                print(f"[VLMGate] use step={self.step} no completed decision yet", flush=True)
+            elif self._alpha_active(alpha):
+                print(
+                    f"[VLMGate] use step={self.step} decision_frame={decision.frame_id} "
+                    f"age={age} action={getattr(decision, 'action', 'none')} reason={decision.reason}",
+                    flush=True,
+                )
+        return alpha
+
+    def _vlm_submit_frame(self, input_data: dict, speed: float) -> None:
+        """Feed the current frame to the VLM gate (submit if allowed, otherwise just buffer it)."""
+        front_image = self._vlm_front_image(input_data)
+        if self.vlm_min_speed <= 0.0 or speed > self.vlm_min_speed:
+            history_xyz, history_rot = self._vlm_ego_history()
+            self.vlm_gate.submit(
+                frame_id=self.step,
+                rgb_image=front_image,
+                speed=speed,
+                command=self._vlm_command_id(input_data),
+                target_point=input_data["target_point"],
+                ego_history_xyz=history_xyz,
+                ego_history_rot=history_rot,
+            )
         else:
-            save_path = Path("fused_features")
+            # Keep the frame buffer filled so later requests still get their past frames.
+            self.vlm_gate.observe(self.step, front_image)
 
-        if self.route_run_id:
-            save_path /= self.route_run_id
-        return save_path
+    def _vlm_log_fields(self) -> dict:
+        if self.vlm_gate is None:
+            return {}
+        decision = self.vlm_last_decision
+        return {
+            "vlm_decision_frame": None if decision is None else int(decision.frame_id),
+            "vlm_decision_age_frames": self.vlm_decision_age_frames,
+            "vlm_action": None if decision is None else str(decision.action),
+            "vlm_reason": None if decision is None else str(decision.reason)[:240],
+            "vlm_error": None if decision is None else str(decision.error),
+        }
+
+    def _apply_override_traj(self, open_loop_prediction: OpenLoopPrediction, side: str):
+        """Keep forward coordinate (x) of route/waypoints, replace lateral (y, right +) by the template."""
+
+        def _swap(points):
+            if points is None:
+                return None
+            p = points.clone()  # (1, N, 2), x forward, y right
+            s = p[0, :, 0].detach().float().cpu().numpy()
+            lat = self.override_traj.lateral(s, side)
+            p[0, :, 1] = torch.as_tensor(lat, device=p.device, dtype=p.dtype)
+            return p
+
+        return dataclasses.replace(
+            open_loop_prediction,
+            pred_route=_swap(open_loop_prediction.pred_route),
+            pred_future_waypoints=_swap(open_loop_prediction.pred_future_waypoints),
+        )
+
+    @staticmethod
+    def _serialize_alpha(activation_alpha):
+        if activation_alpha is None:
+            return None
+        if hasattr(activation_alpha, "detach"):
+            return activation_alpha.detach().cpu().flatten().tolist()
+        if isinstance(activation_alpha, np.ndarray):
+            return activation_alpha.reshape(-1).tolist()
+        if isinstance(activation_alpha, (list, tuple)):
+            return [float(v) for v in activation_alpha]
+        return float(activation_alpha)
 
     def _activation_action_log_path(self) -> Path | None:
         if self.config_closed_loop.save_path is None or not self.route_run_id:
@@ -164,44 +449,46 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir / "activation_actions.jsonl"
 
-    def _planning_queries_path(self, frame_idx: int, model_idx: int = 0) -> Path | None:
-        if self.planning_queries_save_path is None:
+    def _get_feature_path(
+        self,
+        frame_idx: int,
+        feature_name: str = "fused_features",
+        model_idx: int | None = 0
+    ) -> Path | None:
+        if model_idx is None or len(self.feature_collectors) == 0:
             return None
-        save_path = self.planning_queries_save_path
-        if len(self.closed_loop_inference.nets) > 1:
-            save_path /= f"model_{model_idx:02d}"
-        return save_path / f"{int(frame_idx):06d}.pt"
+        return self.feature_collectors[model_idx].resolve_feature_path(
+            feature_dir=self.features_root,
+            frame_idx=frame_idx,
+            feature_name=feature_name,
+            model_idx=model_idx,
+        )
 
-    def _save_planning_queries(self, frame_idx: int) -> None:
+    def _set_planning_queries(self) -> None:
         """Save each ensemble member's post-transformer planner queries."""
-        if self.planning_queries_save_path is None:
-            return
-
         nets = self.closed_loop_inference.nets
         for model_idx, net in enumerate(nets):
             planning_decoder = getattr(net, "planning_decoder", None)
             queries = getattr(planning_decoder, "last_queries", None)
             if queries is None:
                 continue
-
-            feature_path = self._planning_queries_path(frame_idx, model_idx)
-            if feature_path is None:
-                continue
-            feature_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(queries.cpu(), feature_path)
+            self.feature_collectors[model_idx].set_fused_feature(queries)
 
     def _log_activation_action(
         self,
         frame_idx: int,
+        model_idx: int | None,
         control: carla.VehicleControl,
         speed: float,
         pred_target_speed: float,
         stop_for_stop_sign: bool,
+        activation_alpha=None,  # Added parameter
+        extra: dict | None = None,
     ) -> None:
         if self.activation_action_log is None:
             return
 
-        feature_path = self._planning_queries_path(frame_idx)
+        feature_path = self._get_feature_path(frame_idx, model_idx=model_idx)
         record = {
             "frame": int(frame_idx),
             "speed": float(speed),
@@ -210,14 +497,17 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             "throttle": float(control.throttle),
             "brake": float(control.brake),
             "stop_for_stop_sign": bool(stop_for_stop_sign),
-            "activation_alpha": None,
+            "activation_alpha": self._serialize_alpha(activation_alpha),  # Modified from None
             "feature_path": str(feature_path) if feature_path is not None else None,
+            "model_idx": model_idx,
         }
+        if extra:
+            record.update(extra)
         with self.activation_action_log.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(record) + "\n")
 
     @beartype
-    def set_global_plan(
+    def set_global_plan(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         global_plan_gps: typing.Any,
         privileged_org_dense_route_world_coord: list[
@@ -253,9 +543,9 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         self.infraction_recorder.set_scenario(scenario)
         LOG.info("[SensorAgent] Scenario reference set for infraction tracking")
 
-    def _init(self):
+    def _init(self) -> None:
         # Get the hero vehicle and the CARLA world
-        self._vehicle: carla.Actor = CarlaDataProvider.get_hero_actor()
+        self._vehicle: carla.Actor = typing.cast(carla.Actor, CarlaDataProvider.get_hero_actor())
         self._world: carla.World = self._vehicle.get_world()
 
         # Set up video recorder
@@ -288,7 +578,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             self._world.set_weather(weather)
             LOG.info(f"Set weather to: {weather_name}")
             # night mode
-            vehicles = self._world.get_actors().filter("*vehicle*")
+            vehicles: list[carla.Vehicle] = self._world.get_actors().filter("*vehicle*")
             if expert_utils.get_night_mode(weather):
                 for vehicle in vehicles:
                     vehicle.set_light_state(
@@ -299,7 +589,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                     )
             else:
                 for vehicle in vehicles:
-                    vehicle.set_light_state(carla.VehicleLightState.NONE)
+                    # vehicle.set_light_state(carla.VehicleLightState.NONE)
+                    vehicle.set_light_state(
+                        carla.VehicleLightState(
+                            carla.VehicleLightState.NONE
+                        ))
 
     @beartype
     def sensors(self) -> list[dict]:
@@ -341,7 +635,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             return common_utils.inverse_conversion_2d(
                 np.array(point),
                 np.array(ego_position),
-                self.compass,
+                typing.cast(float, self.compass),
             )
 
         next_target_points = [tp[0].tolist() for tp in planner.route]
@@ -378,7 +672,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     @torch.inference_mode()
-    def tick(self, input_data: dict) -> dict:
+    def tick(self, input_data: dict, use_kalman_filter: bool = True) -> dict:
         """Pre-processes sensor data"""
         input_data = super().tick(
             input_data,
@@ -523,7 +817,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     @torch.inference_mode()
-    def run_step(self, input_data: dict, _, __=None) -> carla.VehicleControl:
+    def run_step(self, input_data: dict, timestamp: float, __=None) -> carla.VehicleControl:
         self.step += 1
 
         if not self.initialized:
@@ -541,7 +835,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         input_data = self.tick(input_data)
 
         # Transform the data into torch tensor comforting with data loader's format.
-        input_data_tensors = {
+        input_data_tensors: dict[str, torch.Tensor] = {
             "rgb": torch.Tensor(input_data["rgb"]).to(self.device, dtype=torch.float32)[
                 None
             ],
@@ -570,7 +864,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             "next_command": torch.Tensor(input_data["next_command"])
             .to(self.device, dtype=torch.float32)
             .view(1, 6),
-            "town": np.array([self._world.get_map().name.split("/")[-1]]),
+            "town": np.array([self._world.get_map().name.split("/")[-1]]),  # pyright: ignore[reportAssignmentType]
         }
 
         # Add radar data if available
@@ -597,11 +891,64 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 + ".pth",
             )
 
-        # Forward pass
-        closed_loop_prediction: ClosedLoopPrediction = (
-            self.closed_loop_inference.forward(data=input_data_tensors)
-        )
-        self._save_planning_queries(self.step)
+        self.closed_loop_inference.next_step()  # Increment the inference step counter
+
+        override_action = None
+
+        # The policy owns everything alpha-related (single forward, or several candidates + selection).
+        # predict() is side-effect free w.r.t. the PID controllers; control() runs once on the winner.
+        if isinstance(self.activation_policy, DepthTTCPolicy):
+            decision = self.activation_policy.decide(
+                frame=self.step,
+                speed=float(input_data["speed"]),
+                predict=lambda alpha: self.closed_loop_inference.predict(input_data_tensors, alpha),
+                get_image=lambda: self._depth_ttc_camera_image(input_data),
+                input_data=input_data,
+            )
+            closed_loop_prediction: ClosedLoopPrediction = self.closed_loop_inference.control(
+                data=input_data_tensors,
+                open_loop_prediction=decision.prediction,
+                steering_alpha=decision.alpha,
+            )
+            steering_alpha = closed_loop_prediction.steering_alpha
+        else:
+            if self.vlm_gate is not None:
+                # Latest VLM decision (+ its age) -> alpha, then hand the current frame to the VLM.
+                steering_alpha = self._vlm_policy_alpha()
+                self._vlm_submit_frame(input_data, speed=float(input_data["speed"]))
+            else:
+                steering_alpha = self.activation_policy.alpha(self.step)
+
+            # closed_loop_prediction = self.closed_loop_inference.forward(
+            #     data=input_data_tensors,
+            #     steering_alpha=steering_alpha
+            # )
+            if self.steering_override:
+                override_action = classify_override_alpha(steering_alpha)
+                # no activation steering: forward with alpha=None
+                open_loop = self.closed_loop_inference.predict(input_data_tensors, None)
+                if override_action in ("left", "right"):
+                    open_loop = self._apply_override_traj(open_loop, override_action)
+                closed_loop_prediction = self.closed_loop_inference.control(
+                    data=input_data_tensors,
+                    open_loop_prediction=open_loop,
+                    steering_alpha=steering_alpha,  # only logged
+                )
+            else:
+                closed_loop_prediction = self.closed_loop_inference.forward(
+                    data=input_data_tensors, steering_alpha=steering_alpha
+                )
+
+        # Collect and save intermediate features via FeatureCollector
+        if self.save_features and len(self.feature_collectors) > 0:
+            self._set_planning_queries()
+            for model_idx, net in enumerate(self.closed_loop_inference.nets):
+                self.feature_collectors[model_idx].collect(
+                    model=net,
+                    frame_idx=self.step,
+                    model_idx=model_idx,
+                )
+
         # Update bounding boxes
         if (
             closed_loop_prediction.pred_bounding_box_vehicle_system is not None
@@ -648,6 +995,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             throttle=float(closed_loop_prediction.throttle),
             brake=float(closed_loop_prediction.brake),
         )
+        if self.steering_override:
+            if override_action == "brake":
+                self.control = carla.VehicleControl(
+                    steer=self.control.steer, throttle=0.0, brake=1.0
+                )
 
         # CARLA will not let the car drive in the initial frames. This help the filter not get confused.
         if self.step < self.training_config.inital_frames_delay:
@@ -659,13 +1011,41 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             if pred_target_speed is not None
             else 0.0
         )
-        self._log_activation_action(
-            frame_idx=self.step,
-            control=self.control,
-            speed=float(input_data["speed"].item()),
-            pred_target_speed=pred_target_speed_value,
-            stop_for_stop_sign=stop_for_stop_sign,
-        )
+
+        if os.environ.get("DEBUG_LOG_EGO_STAT", "").lower() in (
+            "1",
+            "true",
+            "t",
+            "yes",
+            "y",
+        ):
+            print(
+                "[EgoStat] "
+                f"frame={self.step} "
+                f"speed={float(input_data['speed'].item()):.4f} "
+                f"brake={float(self.control.brake):.4f} "
+                f"steer={float(self.control.steer):.4f} "
+                f"throttle={float(self.control.throttle):.4f} "
+                f"pred_target_speed={pred_target_speed_value:.4f}",
+                flush=True,
+            )
+
+        # Always write activation_actions.jsonl (needs config_closed_loop.save_path + route id).
+        # Without feature collectors there is a single record per step (model_idx=None, feature_path=None);
+        # with feature collectors there is one record per ensemble member, as before.
+        log_model_indices = list(range(len(self.feature_collectors))) or [None]
+        for model_idx in log_model_indices:
+            self._log_activation_action(
+                frame_idx=self.step,
+                model_idx=model_idx,
+                control=self.control,
+                speed=float(input_data["speed"].item()),
+                pred_target_speed=pred_target_speed_value,
+                stop_for_stop_sign=stop_for_stop_sign,
+                activation_alpha=steering_alpha,
+                # extra=self._vlm_log_fields(),
+                extra={**self._vlm_log_fields(), "override_action": override_action},
+            )
 
         # Check for infractions at this step
         self.check_infractions()
@@ -692,7 +1072,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 "route_curvature": torch.Tensor(
                     [
                         common_utils.waypoints_curvature(
-                            closed_loop_prediction.pred_route.squeeze(),
+                            typing.cast(torch.Tensor, closed_loop_prediction.pred_route).squeeze(),
                         ),
                     ],
                 ),
@@ -759,6 +1139,18 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             ).visualize_inference_prediction()
             image = np.array(image).astype(np.uint8)
 
+            # Add frame number to upper-right corner
+            cv2.putText(
+                image,
+                f"Frame: {self.step}",
+                (image.shape[1] - 240, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
             # Save debug image and video using VideoRecorder
             if hasattr(self, "video_recorder"):
                 self.video_recorder.save_debug_video_frame(image)
@@ -777,6 +1169,9 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     def destroy(self, results=None):
         LOG.info(results)
+
+        if getattr(self, "vlm_gate", None) is not None:
+            self.vlm_gate.stop()
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):
@@ -982,5 +1377,5 @@ class ForceMovePostProcessor:
         return current_throttle, current_brake
 
 
-if __name__ == "__main__":
-    sensor_agent = SensorAgent()
+# if __name__ == "__main__":
+#     sensor_agent = SensorAgent()

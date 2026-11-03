@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import jaxtyping as jt
 import numpy as np
@@ -20,9 +21,15 @@ from lead.tfv6.tfv6 import Prediction
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
 
+from activation_steering.feature_collectors.tfv6 import TFv6FeatureCollector, FeatureCollector
+
 np.set_printoptions(suppress=True)
 
 LOG = logging.getLogger(__name__)
+
+
+def strtobool(v: str | bool) -> bool:
+    return str(v).lower() in ("yes", "y", "true", "t", "1")
 
 
 class OpenLoopInference:
@@ -91,6 +98,25 @@ class OpenLoopInference:
             )
             net.cuda(device=self.device).eval()
             self.nets.append(net)
+
+        # Feature Collector Setup
+        self.save_features = strtobool(os.environ.get("SAVE_FEATURES", "False"))
+        features_root = os.environ.get("FEATURES_ROOT", None)
+        self.feature_collectors: list[FeatureCollector] = []
+
+        if self.save_features:
+            if features_root is None:
+                raise ValueError("SAVE_FEATURES is set to True but FEATURES_ROOT is not set.")
+            self.features_root = Path(features_root)
+            for model_idx, net in enumerate(self.nets):
+                feature_collector = TFv6FeatureCollector(
+                    output_root=self.features_root,
+                    model_idx=model_idx,
+                    save_fused=True,
+                    decoder_layers=(4, 5, 6),
+                )
+                self.feature_collectors.append(feature_collector)
+
         self.step = 4  # Constant so produced images start with 5, not really important
 
     @beartype
@@ -318,7 +344,12 @@ class OpenLoopInference:
         return None
 
     @beartype
-    def ensemble(self, _, predictions: list[Prediction]) -> OpenLoopPrediction:
+    def ensemble(
+        self,
+        data: dict[str, torch.Tensor],
+        predictions: list[Prediction],
+        steering_alpha: float | list[float] | None = None,
+    ) -> OpenLoopPrediction:
         """
         Args:
             predictions: List of dictionaries containing the predictions of each model

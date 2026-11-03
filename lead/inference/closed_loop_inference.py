@@ -1,4 +1,6 @@
+import os
 from dataclasses import dataclass
+from typing import Optional, Union
 
 import jaxtyping as jt
 import numpy as np
@@ -11,6 +13,8 @@ from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopInference, OpenLoopPrediction
 from lead.tfv6.tfv6 import Prediction
 from lead.training.config_training import TrainingConfig
+
+from activation_steering.steering_manager.tfv6_steering_manager import Tfv6SteeringManager
 
 np.set_printoptions(suppress=True)
 
@@ -27,6 +31,7 @@ class ClosedLoopPrediction(OpenLoopPrediction):
     route_steer: float
     target_speed_throttle: float
     target_speed_brake: float
+    steering_alpha: Optional[Union[float, list[float]]] = None
 
 
 class ClosedLoopInference(OpenLoopInference):
@@ -72,6 +77,162 @@ class ClosedLoopInference(OpenLoopInference):
         )
 
         self.step = 4  # Constant so produced images start with 5, not really important
+        self.inference_step = 0
+
+        # Steering manager initialization
+        steering_dir = os.environ.get("STEERING_VECTORS_DIR")
+        feature_name = os.environ.get("STEERING_FEATURE_NAME", "decoder_layer5")
+        self.steering_manager = (
+            Tfv6SteeringManager(
+                steering_root=steering_dir,
+                device=self.device,
+                feature_name=feature_name,
+            )
+            if steering_dir is not None
+            else None
+        )
+        if self.steering_manager is None:
+            print("[ClosedLoopInference.__init__] STEERING_VECTORS_DIR not set: "
+                  "any steering alpha requested by a policy will be IGNORED.", flush=True)
+
+        self.target_layer = 5
+        if "decoder_layer" in feature_name:
+            try:
+                self.target_layer = int(feature_name.replace("decoder_layer", ""))
+            except ValueError:
+                self.target_layer = 5
+        elif feature_name == "fused_features":
+            self.target_layer = -1
+
+        print(f"[ClosedLoopInference.__init__] Number of nets: {len(self.nets)}")
+        for model_idx, net in enumerate(self.nets):
+            print(f"    Net {model_idx}: {net.__class__.__name__}, Size: {sum(p.numel() for p in net.parameters())}")
+
+        # if env var "DEBUG_LOG_STEERING_DIRECTION" is set, we will log the steering direction at each step
+        self.debug_log_steering_direction = os.environ.get("DEBUG_LOG_STEERING_DIRECTION", "0") in ["1", "true", "True"]
+
+    @staticmethod
+    @beartype
+    def _get_steering_direction_from_alphas(alphas: list[float] | None) -> int:
+        """
+        Determine steering direction based on the provided alphas.
+        Returns:
+            -1 for no steering, 0 for brake, 1 for left, 2 for right
+        """
+        if alphas is None or all(a <= 0.0 for a in alphas):
+            return -1  # No steering
+
+        if len(alphas) != 3:
+            raise ValueError(f"Expected 3 alphas for left, straight, right, got {alphas}")
+
+        # Order of actions is [brake, left, right]
+        if alphas[0] > alphas[1] and alphas[0] > alphas[2]:
+            return 0  # Brake
+        elif alphas[1] > alphas[0] and alphas[1] > alphas[2]:
+            return 1  # Left
+        elif alphas[2] > alphas[0] and alphas[2] > alphas[1]:
+            return 2  # Right
+        else:
+            return -1  # None
+
+    # @staticmethod
+    @beartype
+    def _get_steering_direction(self, prediction: Prediction) -> tuple[int, float]:
+        """
+        Check future waypoints or route checkpoints for lateral sign
+        Returns:
+            0 for straight, 1 for left, 2 for right, -1 for no prediction
+        """
+        points = getattr(prediction, "pred_future_waypoints", None)
+
+        if self.debug_log_steering_direction:
+            print(f"[ClosedLoopInference.get_steering_direction] Prediction points: {points}")
+
+        if points is None:
+            points = getattr(prediction, "pred_route", None)
+            if self.debug_log_steering_direction:
+                print(f"[ClosedLoopInference.get_steering_direction] Route points: {points}")
+
+        if points is not None and points.shape[1] > 0:
+            mean_lat = points[0, :3, 0].mean().item()
+            mean_lat_all = points[0, :, 0].mean().item()
+            if self.debug_log_steering_direction:
+                print(f"[ClosedLoopInference.get_steering_direction] Mean lateral offset(3/all): {mean_lat}/{mean_lat_all}")
+            if abs(mean_lat) < 0.05:
+                return 0, 0.0  # Straight
+            # Using the mean lateral offset (x-axis) of the near-term trajectory
+            # return torch.sign(points[0, :3, 0].mean()).item()
+            if torch.sign(points[0, :3, 0].mean()).item() > 0:
+                return 2, mean_lat  # Right
+            else:
+                return 1, mean_lat  # Left
+        return -1, 0.0  # No prediction
+
+    @staticmethod
+    def _normalize_alpha(steering_alpha: Optional[Union[float, list[float]]]) -> Optional[list[float]]:
+        """None -> None, scalar -> [a, a, a], 3-sequence -> list of 3 floats."""
+        if steering_alpha is None:
+            return None
+        if isinstance(steering_alpha, (int, float, np.floating)):
+            return [float(steering_alpha)] * 3
+        if isinstance(steering_alpha, (list, tuple, np.ndarray)) and len(steering_alpha) == 3:
+            return [float(a) for a in steering_alpha]
+        raise ValueError(
+            f"Steering alpha must be a float or a list of 3 floats, got {steering_alpha}",
+        )
+
+    def next_step(self):
+        """Increment the inference step counter. Useful for external control of the step count."""
+        self.inference_step += 1
+
+    def predict(
+        self,
+        data: dict[str, torch.Tensor],
+        steering_alpha: Optional[Union[float, list[float]]] = None,
+    ) -> OpenLoopPrediction:
+        """Run all ensemble nets and fuse them. NO controller (PID) state is touched.
+
+        Safe to call several times per frame (e.g. one call per Depth-TTC candidate).
+        """
+        steering_alpha = self._normalize_alpha(steering_alpha)
+        predictions: list[Prediction] = []
+        for model_idx, net in enumerate(self.nets):
+            steering_vector = None
+            if self.steering_manager is not None:
+                steering_vector = self.steering_manager.get_steering_vector(
+                    model_idx=model_idx,
+                    alpha_input=steering_alpha,
+                )
+            predictions.append(
+                net.forward(
+                    data=data,
+                    steering_alpha=steering_alpha,
+                    steering_vector=steering_vector,
+                    target_layer=self.target_layer,
+                ),
+            )
+        return super().ensemble(data, predictions)
+
+    def control(
+        self,
+        data: dict[str, torch.Tensor],
+        open_loop_prediction: OpenLoopPrediction,
+        steering_alpha: Optional[Union[float, list[float]]] = None,
+    ) -> ClosedLoopPrediction:
+        """Turn the chosen open-loop prediction into steer/throttle/brake. Call ONCE per frame:
+        the PID controllers are stateful (integral / derivative terms)."""
+        print(f"[ClosedLoopInference.control] Inference step: {self.inference_step}")
+        print(f"[ClosedLoopInference.control] Steering alpha: {steering_alpha}")
+        return self._to_closed_loop(
+            data, open_loop_prediction, self._normalize_alpha(steering_alpha))
+
+    def forward(
+        self,
+        data: dict[str, torch.Tensor],
+        steering_alpha: Optional[Union[float, list[float]]] = None,
+    ) -> ClosedLoopPrediction:
+        """Single-candidate convenience path: predict() followed by control()."""
+        return self.control(data, self.predict(data, steering_alpha), steering_alpha)
 
     @jt.jaxtyped(typechecker=beartype)
     def execute_route_and_target_speed(
@@ -146,10 +307,12 @@ class ClosedLoopInference(OpenLoopInference):
         desired_speed = (
             np.linalg.norm(waypoints[half_second - 1] - waypoints[one_second - 1]) * 2.0
         )
-        delta_speed = np.clip(
-            desired_speed - speed,
-            0.0,
-            self.config_closed_loop.wp_delta_clip,
+        delta_speed = float(
+            np.clip(
+                desired_speed - speed,
+                0.0,
+                self.config_closed_loop.wp_delta_clip,
+            )
         )
 
         brake = (desired_speed < self.config_closed_loop.brake_speed) or (
@@ -179,7 +342,7 @@ class ClosedLoopInference(OpenLoopInference):
                 break
 
         aim = waypoints[aim_index]
-        angle = np.degrees(np.arctan2(aim[1], aim[0])) / 90.0
+        angle = float(np.degrees(np.arctan2(aim[1], aim[0])) / 90.0)
         if speed < 0.01:
             # When we don't move we don't want the angle error to accumulate in the integral
             angle = 0.0
@@ -195,6 +358,7 @@ class ClosedLoopInference(OpenLoopInference):
         self,
         data: dict[str, torch.Tensor],
         predictions: list[Prediction],
+        steering_alpha: Optional[float | list[float]] = None,
     ) -> ClosedLoopPrediction:
         """
         Args:
@@ -203,12 +367,21 @@ class ClosedLoopInference(OpenLoopInference):
         Returns:
             ClosedLoopPrediction: Dataclass containing all predictions
         """
-        ego_speed = data["speed"].to(self.device, dtype=torch.float32).unsqueeze(1)
         open_loop_prediction: OpenLoopPrediction = super().ensemble(data, predictions)
+        return self._to_closed_loop(data, open_loop_prediction, steering_alpha)
+
+    def _to_closed_loop(
+        self,
+        data: dict[str, torch.Tensor],
+        open_loop_prediction: OpenLoopPrediction,
+        steering_alpha: Optional[Union[float, list[float]]] = None,
+    ) -> ClosedLoopPrediction:
+        print(f"[ClosedLoopInference._to_closed_loop] Inference step: {self.inference_step}")
+        ego_speed = data["speed"].to(self.device, dtype=torch.float32).unsqueeze(1)
 
         # Convert high-level commands to vehicle controls
-        steer = throttle = brake = waypoint_steer = waypoint_throttle = (
-            waypoint_brake
+        steer = throttle = brake = waypoints_steer = waypoints_throttle = (
+            waypoints_brake
         ) = route_steer = target_speed_throttle = target_speed_brake = None
 
         if open_loop_prediction.pred_route is not None:
@@ -269,10 +442,11 @@ class ClosedLoopInference(OpenLoopInference):
             steer=steer,
             throttle=throttle,
             brake=brake,
-            waypoints_steer=waypoint_steer,
-            waypoints_throttle=waypoint_throttle,
-            waypoints_brake=waypoint_brake,
+            waypoints_steer=waypoints_steer,
+            waypoints_throttle=waypoints_throttle,
+            waypoints_brake=waypoints_brake,
             route_steer=route_steer,
             target_speed_throttle=target_speed_throttle,
             target_speed_brake=target_speed_brake,
+            steering_alpha=steering_alpha,
         )
