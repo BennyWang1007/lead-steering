@@ -150,16 +150,6 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if self.activation_action_log is not None:
             LOG.info("Saving activation actions to %s", self.activation_action_log)
 
-        # Steering override initialization
-        self.steering_override = steering_override_enabled_from_env()
-        self.override_traj = OverrideTrajectory.from_env() if self.steering_override else None
-        # if self.steering_override and self.depth_ttc_steering:
-        #     raise ValueError(
-        #         "STEERING_OVERRIDE is not compatible with Depth-TTC: candidate forwards would all be "
-        #         "identical (no steering applied), so the candidate scoring is meaningless."
-        #     )
-        print("[SensorAgent.setup] STEERING_OVERRIDE:", self.steering_override)
-
         # Activation steering & Depth-TTC initialization
         self.depth_ttc_steering = depth_ttc_enabled_from_env()
         self.depth_ttc_client = None
@@ -174,6 +164,17 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 "forward passes, then uses the selected candidate for control",
                 flush=True,
             )
+
+        # STEERING_OVERRIDE (ablation): alpha is NOT injected into the network. It is turned into a
+        # direct edit of the open-loop prediction (left/right: route+waypoint lateral, brake: target speed 0)
+        # and, for brake, a hard brake=1 on the final control. Works together with Depth-TTC.
+        self.steering_override = steering_override_enabled_from_env()
+        self.override_traj = OverrideTrajectory.from_env() if self.steering_override else None
+        # TFv6 route/waypoints are (x forward, y right) -> lateral axis 1. Set to 0 if the sign test shows
+        # your checkpoint uses (x lateral, y forward).
+        self.override_lateral_axis = int(os.environ.get("STEERING_OVERRIDE_TFV6_LATERAL_AXIS", 1))
+        self._override_base = None  # (step, un-steered OpenLoopPrediction), shared by all candidates of a frame
+        print("[SensorAgent.setup] STEERING_OVERRIDE:", self.steering_override)
 
         vlm_enabled = self._env_flag("VLM_STEERING") and not self.depth_ttc_steering
         self.activation_policy = policy_from_env(
@@ -412,24 +413,6 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             "vlm_error": None if decision is None else str(decision.error),
         }
 
-    def _apply_override_traj(self, open_loop_prediction: OpenLoopPrediction, side: str):
-        """Keep forward coordinate (x) of route/waypoints, replace lateral (y, right +) by the template."""
-
-        def _swap(points):
-            if points is None:
-                return None
-            p = points.clone()  # (1, N, 2), x forward, y right
-            s = p[0, :, 0].detach().float().cpu().numpy()
-            lat = self.override_traj.lateral(s, side)
-            p[0, :, 1] = torch.as_tensor(lat, device=p.device, dtype=p.dtype)
-            return p
-
-        return dataclasses.replace(
-            open_loop_prediction,
-            pred_route=_swap(open_loop_prediction.pred_route),
-            pred_future_waypoints=_swap(open_loop_prediction.pred_future_waypoints),
-        )
-
     @staticmethod
     def _serialize_alpha(activation_alpha):
         if activation_alpha is None:
@@ -505,6 +488,57 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             record.update(extra)
         with self.activation_action_log.open("a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(record) + "\n")
+
+    # ------------------------------------------------------------------ STEERING_OVERRIDE
+    def _apply_override_traj(self, prediction, side: str):
+        """Keep the forward coordinate of route/waypoints, replace the lateral one by the template."""
+        fwd = 1 - self.override_lateral_axis
+        lat = self.override_lateral_axis
+
+        def _swap(points):
+            if points is None:
+                return None
+            p = points.clone()  # (1, N, 2)
+            s = p[0, :, fwd].detach().float().cpu().numpy()
+            offset = self.override_traj.lateral(s, side)
+            p[0, :, lat] = torch.as_tensor(offset, device=p.device, dtype=p.dtype)
+            return p
+
+        return dataclasses.replace(
+            prediction,
+            pred_route=_swap(prediction.pred_route),
+            pred_future_waypoints=_swap(prediction.pred_future_waypoints),
+        )
+
+    def _apply_override_brake(self, prediction):
+        """Brake candidate: target speed -> 0, so the PID brakes and Depth-TTC scores a stopping candidate."""
+        field_names = {f.name for f in dataclasses.fields(prediction)}
+        changes = {}
+        speed = getattr(prediction, "pred_target_speed_scalar", None)
+        if speed is not None:
+            changes["pred_target_speed_scalar"] = torch.zeros_like(speed)
+        dist = getattr(prediction, "pred_target_speed_distribution", None)
+        if dist is not None and "pred_target_speed_distribution" in field_names:
+            one_hot = torch.zeros_like(dist)
+            one_hot[..., 0] = 1.0  # ASSUMPTION: speed class 0 == 0 m/s
+            changes["pred_target_speed_distribution"] = one_hot
+        return dataclasses.replace(prediction, **changes)
+
+    def _predict_for_alpha(self, data, alpha):
+        """predict() for one alpha. In override mode alpha is not injected into the network;
+        it becomes a direct edit of the (un-steered) open-loop prediction instead."""
+        if not self.steering_override:
+            return self.closed_loop_inference.predict(data, alpha)
+        action = classify_override_alpha(alpha)
+        # the un-steered forward is identical for every candidate of this frame -> run it once
+        if self._override_base is None or self._override_base[0] != self.step:
+            self._override_base = (self.step, self.closed_loop_inference.predict(data, None))
+        prediction = self._override_base[1]
+        if action in ("left", "right"):
+            return self._apply_override_traj(prediction, action)
+        if action == "brake":
+            return self._apply_override_brake(prediction)
+        return prediction
 
     @beartype
     def set_global_plan(  # pyright: ignore[reportIncompatibleMethodOverride]
@@ -893,15 +927,13 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
         self.closed_loop_inference.next_step()  # Increment the inference step counter
 
-        override_action = None
-
         # The policy owns everything alpha-related (single forward, or several candidates + selection).
         # predict() is side-effect free w.r.t. the PID controllers; control() runs once on the winner.
         if isinstance(self.activation_policy, DepthTTCPolicy):
             decision = self.activation_policy.decide(
                 frame=self.step,
                 speed=float(input_data["speed"]),
-                predict=lambda alpha: self.closed_loop_inference.predict(input_data_tensors, alpha),
+                predict=lambda alpha: self._predict_for_alpha(input_data_tensors, alpha),
                 get_image=lambda: self._depth_ttc_camera_image(input_data),
                 input_data=input_data,
             )
@@ -918,26 +950,19 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 self._vlm_submit_frame(input_data, speed=float(input_data["speed"]))
             else:
                 steering_alpha = self.activation_policy.alpha(self.step)
-
-            # closed_loop_prediction = self.closed_loop_inference.forward(
-            #     data=input_data_tensors,
-            #     steering_alpha=steering_alpha
-            # )
             if self.steering_override:
-                override_action = classify_override_alpha(steering_alpha)
-                # no activation steering: forward with alpha=None
-                open_loop = self.closed_loop_inference.predict(input_data_tensors, None)
-                if override_action in ("left", "right"):
-                    open_loop = self._apply_override_traj(open_loop, override_action)
                 closed_loop_prediction = self.closed_loop_inference.control(
                     data=input_data_tensors,
-                    open_loop_prediction=open_loop,
-                    steering_alpha=steering_alpha,  # only logged
+                    open_loop_prediction=self._predict_for_alpha(input_data_tensors, steering_alpha),
+                    steering_alpha=steering_alpha,  # only logged, never injected
                 )
             else:
                 closed_loop_prediction = self.closed_loop_inference.forward(
-                    data=input_data_tensors, steering_alpha=steering_alpha
+                    data=input_data_tensors,
+                    steering_alpha=steering_alpha
                 )
+
+        override_action = classify_override_alpha(steering_alpha) if self.steering_override else None
 
         # Collect and save intermediate features via FeatureCollector
         if self.save_features and len(self.feature_collectors) > 0:
@@ -995,15 +1020,14 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             throttle=float(closed_loop_prediction.throttle),
             brake=float(closed_loop_prediction.brake),
         )
-        if self.steering_override:
-            if override_action == "brake":
-                self.control = carla.VehicleControl(
-                    steer=self.control.steer, throttle=0.0, brake=1.0
-                )
 
         # CARLA will not let the car drive in the initial frames. This help the filter not get confused.
         if self.step < self.training_config.inital_frames_delay:
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
+
+        # STEERING_OVERRIDE brake: applied last so ForceMove / stop-sign post-processors cannot undo it.
+        if override_action == "brake":
+            self.control = carla.VehicleControl(steer=self.control.steer, throttle=0.0, brake=1.0)
 
         pred_target_speed = closed_loop_prediction.pred_target_speed_scalar
         pred_target_speed_value = (
@@ -1043,7 +1067,6 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 pred_target_speed=pred_target_speed_value,
                 stop_for_stop_sign=stop_for_stop_sign,
                 activation_alpha=steering_alpha,
-                # extra=self._vlm_log_fields(),
                 extra={**self._vlm_log_fields(), "override_action": override_action},
             )
 

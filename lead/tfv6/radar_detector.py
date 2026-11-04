@@ -205,7 +205,7 @@ class RadarDetector(nn.Module):
         tokens = tokens + fn.gen_sineembed_for_position(
             fn.unit_normalize_bev_points(pos.reshape(-1, 2), self.config),
             hidden_dim=self.config.radar_token_dim,
-        ).reshape(tokens.shape)  # Positional embedding
+        ).reshape(tokens.shape).to(tokens.dtype)  # Positional embedding
         return tokens
 
     @beartype

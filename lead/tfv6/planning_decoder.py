@@ -1,5 +1,6 @@
 import logging
 import math
+import typing
 
 import jaxtyping as jt
 import torch
@@ -100,6 +101,8 @@ class PlanningDecoder(nn.Module):
         radar_predictions: jt.Float[torch.Tensor, "B Q 4"] | None,
         data: dict,
         log: dict,
+        steering_vector: torch.Tensor | None = None,
+        target_layer: int = 5,  # Default to 5th decoder layer (1-based: layers 1..6), -1 means use fused features to steer
     ) -> tuple[
         jt.Float[torch.Tensor, "B n_checkpoints 2"] | None,
         jt.Float[torch.Tensor, "B n_waypoints 2"],
@@ -129,9 +132,30 @@ class PlanningDecoder(nn.Module):
             log=log,
         )
 
-        bs = context_tokens.shape[0]
+        # context_tokens = self.planning_context_encoder(
+        #     bev_features=bev_features,
+        #     radar_logits=radar_features,
+        #     radar_predictions=radar_predictions,
+        #     data=data,
+        #     log=log,
+        # )
 
-        queries = self.transformer_decoder(self.query.repeat(bs, 1, 1), context_tokens)
+        # torch.Size([1, 145, 256]) torch.float32
+        # print(
+        #     "[PlanningDecoder] context_encoder OUTPUT:",
+        #     context_tokens.shape,
+        #     context_tokens.dtype,
+        # )
+
+        # self.kv = context_tokens
+
+        # bs = context_tokens.shape[0]
+
+        # decoder_dtype: torch.dtype = self.transformer_decoder.layers[0].self_attn.in_proj_weight.dtype
+        # context_tokens = context_tokens.to(decoder_dtype)
+
+        queries = self.steer(context_tokens, steering_vector, target_layer)
+
         # Expose the complete planner representation for closed-loop feature
         # collection. Detaching avoids retaining a training graph; the heads below
         # still consume the original tensor.
@@ -182,6 +206,87 @@ class PlanningDecoder(nn.Module):
             target_speed_scalar,
             headings.squeeze(-1) if headings is not None else None,
         )
+
+    @beartype
+    def steer(
+        self,
+        context_tokens: torch.Tensor,
+        steering_vector: torch.Tensor | None,
+        target_layer: int = 5
+    ) -> torch.Tensor:
+        decoder_dtype: torch.dtype = self.transformer_decoder.layers[0].self_attn.in_proj_weight.dtype
+        context_tokens = context_tokens.to(decoder_dtype)
+        bs = context_tokens.size(0)
+
+        # print(f"[PlanningDecoder.forward] context_tokens shape: {context_tokens.shape}, dtype: {context_tokens.dtype}")
+        # print(f"[PlanningDecoder.forward] steering_vector: {steering_vector if steering_vector is not None else None}, dtype: {steering_vector.dtype if steering_vector is not None else None}")
+        # print(f"[PlanningDecoder.forward] decoder_dtype: {decoder_dtype}, target_layer: {target_layer} (1-based index, -1 means using fused features to steer)")
+
+        if steering_vector is None:
+            return self.transformer_decoder(self.query.repeat(bs, 1, 1), context_tokens)
+
+        if target_layer == -1:
+            queries = self.transformer_decoder(self.query.repeat(bs, 1, 1), context_tokens)
+            vec = steering_vector.to(queries.device, dtype=queries.dtype)
+            if vec.ndim == 1:
+                vec = vec.unsqueeze(0).unsqueeze(0)  # (1, 1, dim)
+            elif vec.ndim == 2:
+                vec = vec.unsqueeze(0)  # (1, num_queries, dim)
+
+            return queries + vec
+
+            similarity = torch.cosine_similarity(queries, vec, dim=-1)
+            similarity = similarity.clamp(min=0.0, max=1.0)
+
+            threshold = 0.8
+            gate = torch.where(
+                similarity > threshold,
+                1.0 - similarity,
+                torch.ones_like(similarity),
+            )
+            print(f"[PlanningDecoder.forward] Steering vector simularity: {similarity}, gate: {gate}")
+
+            queries = queries + vec * gate.unsqueeze(-1)
+            return queries
+
+        # Step-by-step layer iteration through transformer decoder to enable layer-specific steering
+        tgt = self.query.repeat(bs, 1, 1)
+
+        # print(f"[PlanningDecoder.forward] Initial tgt shape: {tgt.shape}, dtype: {tgt.dtype}")
+        # print(f"[PlanningDecoder.forward] context_tokens shape: {context_tokens.shape}, dtype: {context_tokens.dtype}")
+
+        tgt = tgt.to(context_tokens.device, dtype=decoder_dtype)
+        for layer_idx, layer in enumerate(self.transformer_decoder.layers, start=1):
+
+            # print(
+            #     f"\n[L{layer_idx}] "
+            #     f"tgt={tgt.dtype}, "
+            #     f"context={context_tokens.dtype}, "
+            #     f"self_attn_weight={layer.self_attn.in_proj_weight.dtype}, "
+            #     f"norm1_weight={layer.norm1.weight.dtype}"
+            # )
+            # [L*] tgt=torch.bfloat16, context=torch.bfloat16, self_attn_weight=torch.bfloat16, norm1_weight=torch.bfloat16
+
+            tgt = layer(tgt, context_tokens)
+
+            # print(f"[PlanningDecoder.forward] After layer {layer_idx}, tgt shape: {tgt.shape}")
+            # print(f"[PlanningDecoder.forward] target/steering_vec dtype: {tgt.dtype}, {steering_vector.dtype if steering_vector is not None else 'None'}")
+            # [PlanningDecoder.forward] After layer *, tgt shape: torch.Size([1, 19, 256])
+            # [PlanningDecoder.forward] target/steering_vec dtype: torch.bfloat16, None
+
+            if steering_vector is not None and layer_idx == target_layer:
+                vec = steering_vector.to(tgt.device, dtype=tgt.dtype)
+                # print(f"[PlanningDecoder.forward] Adding steering vector at layer {layer_idx}, vec shape: {vec.shape}")
+                if vec.ndim == 1:
+                    vec = vec.unsqueeze(0).unsqueeze(0)  # (1, 1, dim)
+                elif vec.ndim == 2:
+                    vec = vec.unsqueeze(0)  # (1, num_queries, dim)
+                tgt = tgt + vec
+
+        if self.transformer_decoder.norm is not None:
+            return self.transformer_decoder.norm(tgt)
+        else:
+            return tgt
 
     @beartype
     def compute_loss(self, predictions, data: dict, loss: dict, log: dict):

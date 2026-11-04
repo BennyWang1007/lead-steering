@@ -105,7 +105,13 @@ class TFv6(nn.Module):
             ).to(self.device)
 
     @beartype
-    def forward(self, data: dict[str, typing.Any]) -> Prediction:
+    def forward(
+        self,
+        data: dict[str, typing.Any],
+        steering_alpha: typing.Any = None,
+        steering_vector: torch.Tensor | None = None,
+        target_layer: int = 5,
+    ) -> Prediction:
         self.log = {}
         pred_route = pred_future_waypoints = pred_target_speed_distribution = (
             pred_target_speed_scalar
@@ -139,6 +145,8 @@ class TFv6(nn.Module):
                 planner_radar_predictions,
                 data,
                 log=self.log,
+                steering_vector=steering_vector,
+                target_layer=target_layer,
             )
 
         # Semantic segmentation forward pass
@@ -208,7 +216,7 @@ class TFv6(nn.Module):
         # Semantic segmentation loss
         if self.config.use_semantic and self.config.use_carla_data:
             self.semantic_decoder.compute_loss(
-                predictions.pred_semantic,
+                typing.cast(torch.Tensor, predictions.pred_semantic),
                 data,
                 loss,
                 log=self.log,
@@ -217,7 +225,7 @@ class TFv6(nn.Module):
         # Depth estimation loss
         if self.config.use_depth and self.config.use_carla_data:
             self.depth_decoder.compute_loss(
-                predictions.pred_depth,
+                typing.cast(torch.Tensor, predictions.pred_depth),
                 data,
                 loss,
                 log=self.log,
@@ -227,14 +235,14 @@ class TFv6(nn.Module):
         if self.config.use_bev_semantic:
             if self.config.use_carla_data:
                 self.bev_semantic_decoder.compute_loss(
-                    predictions.pred_bev_semantic,
+                    typing.cast(torch.Tensor, predictions.pred_bev_semantic),
                     data,
                     loss,
                     log=self.log,
                 )
             if self.config.use_navsim_data:
                 self.bev_semantic_decoder_navsim.compute_loss(
-                    predictions.pred_bev_semantic_navsim,
+                    typing.cast(torch.Tensor, predictions.pred_bev_semantic_navsim),
                     data,
                     loss,
                     log=self.log,
@@ -245,14 +253,14 @@ class TFv6(nn.Module):
             if self.config.use_carla_data:
                 self.center_net_decoder.compute_loss(
                     data=data,
-                    bounding_box_features=predictions.pred_bounding_box,
+                    bounding_box_features=typing.cast(CenterNetBoundingBoxPrediction, predictions.pred_bounding_box),
                     losses=loss,
                     log=self.log,
                 )
             if self.config.use_navsim_data:
                 self.center_net_decoder_navsim.compute_loss(
                     data=data,
-                    bounding_box_features=predictions.pred_bounding_box_navsim,
+                    bounding_box_features=typing.cast(CenterNetBoundingBoxPrediction, predictions.pred_bounding_box_navsim),
                     losses=loss,
                     log=self.log,
                 )
@@ -260,7 +268,7 @@ class TFv6(nn.Module):
         # Radar detection loss
         if self.config.radar_detection and self.config.use_carla_data:
             self.radar_detector.compute_loss(
-                pred=predictions.pred_radar_predictions,
+                pred=typing.cast(torch.Tensor, predictions.pred_radar_predictions),
                 data=data,
                 loss=loss,
                 log=self.log,
