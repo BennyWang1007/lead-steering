@@ -1,3 +1,4 @@
+from PIL import features
 import jaxtyping as jt
 import torch
 import torch.nn.functional as F
@@ -129,6 +130,15 @@ class RadarDetector(nn.Module):
             dim=1,
         )  # (B, H*W+1+300, D)
 
+        # print(f"[RadarDetector.forward] kv shape: {kv.shape}, kv dtype: {kv.dtype}")
+        # print(f"[RadarDetector.forward] bev_tokens shape: {bev_tokens.shape}, ego_vel_token shape: {ego_vel_token.shape}, radar_tokens shape: {radar_tokens.shape}")
+        # print(f"[RadarDetector.forward] bev_tokens dtype: {bev_tokens.dtype}, ego_vel_token dtype: {ego_vel_token.dtype}, radar_tokens dtype: {radar_tokens.dtype}")
+        # print(f"[RadarDetector.forward] radar_tokens dtype: {radar_tokens.dtype}")
+        # [RadarDetector.forward] kv shape: torch.Size([1, 421, 256]), kv dtype: torch.bfloat16
+        # [RadarDetector.forward] bev_tokens shape: torch.Size([1, 120, 256]), ego_vel_token shape: torch.Size([1, 1, 256]), radar_tokens shape: torch.Size([1, 300, 256])
+        # [RadarDetector.forward] bev_tokens dtype: torch.bfloat16, ego_vel_token dtype: torch.bfloat16, radar_tokens dtype: torch.bfloat16
+        # [RadarDetector.forward] radar_tokens dtype: torch.bfloat16
+
         # Cross-attention
         radar_Features = self.tf(self.q.repeat(kv.shape[0], 1, 1), kv)  # (B, Q, D)
 
@@ -190,7 +200,10 @@ class RadarDetector(nn.Module):
             num_classes=self.num_radar_sensors,
         ).to(self.device, dtype=self.config.torch_float_type)  # (B, 300, 4)
         radar_features = fn.bev_grid_sample(bev_tokens, pos, self.config)  # (B, 300, D)
+        # print("radar_features:", radar_features.dtype)
         rel_vel_features = rel_vel / self.config.max_speed
+        # print("rel_vel_features:", rel_vel_features.dtype)
+        # print("sensor_features:", sensor_features.dtype)
         features = torch.cat(
             [
                 radar_features,
@@ -199,9 +212,22 @@ class RadarDetector(nn.Module):
             ],
             dim=-1,
         )
+        # print("features:", features.dtype)
 
         tokens = self.radar_point_tokenizer(features)
+        # print("tokens after tokenizer:", tokens.dtype)
         pos = pos.reshape(-1, 2)
+
+        # pos_embed = fn.gen_sineembed_for_position(
+        #     fn.unit_normalize_bev_points(pos.reshape(-1, 2), self.config),
+        #     hidden_dim=self.config.radar_token_dim,
+        # ).reshape(tokens.shape)
+
+        # print("pos_embed:", pos_embed.dtype)
+
+        # tokens = tokens + pos_embed
+        # print("tokens after pos embed:", tokens.dtype)
+
         tokens = tokens + fn.gen_sineembed_for_position(
             fn.unit_normalize_bev_points(pos.reshape(-1, 2), self.config),
             hidden_dim=self.config.radar_token_dim,
