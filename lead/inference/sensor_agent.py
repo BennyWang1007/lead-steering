@@ -40,7 +40,7 @@ from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import Visualizer
 
 from activation_steering.feature_collectors.tfv6 import TFv6FeatureCollector
-from depth_ttc_gate import DepthTTCClient
+from depth_ttc_gate import AsyncDepthTTCClient
 from vlm_gate import AsyncVLMGate
 from activation_steering.policy import (
     depth_ttc_enabled_from_env,
@@ -156,7 +156,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
         print("[SensorAgent.setup] DEPTH_TTC_STEERING:", self.depth_ttc_steering)
         if self.depth_ttc_steering:
-            self.depth_ttc_client = DepthTTCClient.from_env()
+            self.depth_ttc_client = AsyncDepthTTCClient.from_env()
             LOG.info("Depth TTC steering enabled: %s", self.depth_ttc_client.server_url)
             print(
                 "[DepthTTC] inference interception enabled: "
@@ -238,7 +238,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 "ffmpeg is not installed or not found in PATH. Please install ffmpeg to use video compression.",
             )
 
-        self.debug_image_saved_once = False
+        # self.debug_image_saved_once = False
 
     @staticmethod
     def _env_flag(name: str) -> bool:
@@ -256,33 +256,33 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         """Return the front-camera image expected by the Depth-TTC policy."""
         # os.makedirs("debug_data", exist_ok=True)
 
-        if not self.debug_image_saved_once and self.step > 20:
-            self.debug_image_saved_once = True
+        # if not self.debug_image_saved_once and self.step > 20:
+        #     self.debug_image_saved_once = True
 
-            for i in range(1, 7):
-                key = f"rgb_{i}"
-                if key not in input_data:
-                    continue
-                image = input_data[key]
+        #     for i in range(1, 7):
+        #         key = f"rgb_{i}"
+        #         if key not in input_data:
+        #             continue
+        #         image = input_data[key]
 
-                # Adjust this depending on your actual sensor format.
-                image = np.asarray(image)
+        #         # Adjust this depending on your actual sensor format.
+        #         image = np.asarray(image)
 
-                print(key, image.shape, image.dtype)
-                np.save(f"debug_data/{key}.npy", image)
+        #         print(key, image.shape, image.dtype)
+        #         np.save(f"debug_data/{key}.npy", image)
 
-            for name in ["original_rgb", "rgb"]:
-                if name in input_data:
-                    image = np.asarray(input_data[name])
-                    print(name, image.shape, image.dtype)
-                    np.save(f"debug_data/{name}.npy", image)
+        #     for name in ["original_rgb", "rgb"]:
+        #         if name in input_data:
+        #             image = np.asarray(input_data[name])
+        #             print(name, image.shape, image.dtype)
+        #             np.save(f"debug_data/{name}.npy", image)
 
-            image = np.asarray(input_data["original_rgb"])
-            front_width = self.training_config.camera_calibration[1]["width"]
+        #     image = np.asarray(input_data["original_rgb"])
+        #     front_width = self.training_config.camera_calibration[1]["width"]
 
-            front_image = image[:, :front_width]
-            print("front_image", front_image.shape, front_image.dtype)
-            np.save("debug_data/front_image.npy", front_image)
+        #     front_image = image[:, :front_width]
+        #     print("front_image", front_image.shape, front_image.dtype)
+        #     np.save("debug_data/front_image.npy", front_image)
 
         front_image = input_data.get("rgb_2")
         if front_image is not None:
@@ -1193,6 +1193,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
     def destroy(self, results=None):
         LOG.info(results)
 
+        if getattr(self, "depth_ttc_client", None) is not None:
+            self.depth_ttc_client.stop()
         if getattr(self, "vlm_gate", None) is not None:
             self.vlm_gate.stop()
 
